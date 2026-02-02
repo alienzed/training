@@ -18,6 +18,9 @@ Key behavior:
 WAN-related caps:
 - Square AR: max 1024x1024
 - Non-square AR: max_long_edge=1280, max_short_edge=720
+
+Usage:
+/path/tp/autoset.py --master /path/to/folder-with-clips/
 """
 
 import argparse
