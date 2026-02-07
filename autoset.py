@@ -18,9 +18,6 @@ Key behavior:
 WAN-related caps:
 - Square AR: max 1024x1024
 - Non-square AR: max_long_edge=1280, max_short_edge=720
-
-Usage:
-/path/tp/autoset.py --master /path/to/folder-with-clips/
 """
 
 import argparse
@@ -41,7 +38,7 @@ from pathlib import Path
 # -------------------------
 
 # Upper bound for search; actual caps are AR-specific below.
-MAX_DIM = 1280
+MAX_DIM = 768
 SQUARE_DETAIL_MAX_DIM = 768      # hard cap for square detail buckets
 DETAIL_MAX_DIM = 768            # hard cap for non-square detail buckets
 MIN_FRAMES_FOR_STATS = 16      # Ignore clips shorter than this for stats/buckets
@@ -87,9 +84,9 @@ AR_CLASSES = {
 }
 
 # WAN-ish caps
-MAX_SQUARE_DIM = 1024            # square max 1024x1024
-MAX_NON_SQUARE_LONG = 1280       # e.g. 1280x720, 720x1280 etc.
-MAX_NON_SQUARE_SHORT = 720
+MAX_SQUARE_DIM = 768             # square max 768x768
+MAX_NON_SQUARE_LONG = 768        # e.g. 768x720, 720x768 etc.
+MAX_NON_SQUARE_SHORT = 768
 
 # -------------------------
 # Eval bucket caps (NEW)
@@ -639,6 +636,10 @@ def main():
         type=int,
         default=16,
         help='Desired framerate for all clips that end up in the buckets (default 16, set to 24 for higher‑quality video).')
+    parser.add_argument('--recursive', action='store_true',
+                        help='Recursively scan subdirectories for videos and images (default: single folder only).')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Write detailed JSON outputs (wan_auto_buckets.json, resolution_rankings.json).')
     args = parser.parse_args()
 
     target_fps = args.target_fps   # 16 by default, 24 if the user supplied it
@@ -655,10 +656,17 @@ def main():
 
 
     # Scan videos + images
-    videos = [p for p in master.iterdir()
-              if p.suffix.lower() in [".mp4", ".mov", ".mkv", ".webm"]]
-    images = [p for p in master.iterdir()
-              if p.suffix.lower() in IMAGE_EXTS]
+    if args.recursive:
+        print(f"[INFO] Recursively scanning {master} for videos and images...")
+        videos = [p for p in master.rglob('*') 
+                  if p.is_file() and p.suffix.lower() in [".mp4", ".mov", ".mkv", ".webm"]]
+        images = [p for p in master.rglob('*')
+                  if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    else:
+        videos = [p for p in master.iterdir()
+                  if p.suffix.lower() in [".mp4", ".mov", ".mkv", ".webm"]]
+        images = [p for p in master.iterdir()
+                  if p.suffix.lower() in IMAGE_EXTS]
 
     if not videos and not images:
         print("[ERROR] No videos or images found in master folder.")
@@ -775,104 +783,153 @@ def main():
             if not usable_clips:
                 print(f"[WARN] No usable clips (>= {MIN_FRAMES_FOR_STATS} frames) for AR={ar_label} main group")
             else:
-                # Prefer stable motion clips; short clips are treated as outliers.
-                motion_eligible = [(vid, w, h, f) for (vid, w, h, f) in usable_clips if f >= MIN_FRAMES_FOR_MOTION]
-                frame_counts_all = [f for (_, _, _, f) in motion_eligible]
-
                 # Motion bucket
+                # Use all statistically viable clips (>= MIN_FRAMES_FOR_STATS) to drive
+                # motion frame selection. Do NOT filter by MIN_FRAMES_FOR_MOTION
+                # early — coverage logic must decide.
+                frame_counts_all = [f for (_, _, _, f) in usable_clips]
+
+                # Aim for ~90% coverage for motion buckets but respect user-supplied
+                # coverage (don't reduce below it).
+                motion_coverage = max(args.coverage, 0.9)
+
                 motion_frames = select_frames_with_fallback(
                     frame_counts_all,
                     LONG_MOTION_FRAME_CANDIDATES,
-                    args.coverage
+                    motion_coverage,
                 )
+
+                # soften to user coverage if strict 90% didn't yield a candidate
+                if not motion_frames:
+                    motion_frames = select_frames_with_fallback(
+                        frame_counts_all,
+                        LONG_MOTION_FRAME_CANDIDATES,
+                        args.coverage,
+                    )
+
                 if motion_frames:
+                    # choose resolution using the same pool (usable_clips)
                     res = choose_bucket_resolution(
                         ar_label=ar_label,
                         target_ar=target_ar,
                         frames=motion_frames,
-                        clips=motion_eligible,
-                        coverage_threshold=args.coverage,
+                        clips=usable_clips,
+                        coverage_threshold=motion_coverage,
                         mfp_limit=mfp_limit,
                     )
-                    if res:
+
+                    # If resolution selection failed for some reason, fall back to
+                    # the largest WAN-safe candidate (guarantee existence of motion bucket).
+                    if not res:
+                        cands = generate_candidate_resolutions_for_ar(target_ar, ar_label)
+                        fallback_res = None
+                        for (cw, ch, area) in cands:
+                            if within_wan_caps(ar_label, cw, ch):
+                                fallback_res = (cw, ch, mfp(cw, ch, motion_frames))
+                                break
+                        if fallback_res:
+                            w_m, h_m, mfp_val_m = fallback_res
+                            motion_bucket = (w_m, h_m, motion_frames)
+                            print(f"  Motion bucket (main) [fallback]: {w_m}x{h_m} @ {motion_frames} frames (mfp={mfp_val_m})")
+                        else:
+                            print(f"  [WARN] Could not find any WAN-safe candidate for motion bucket in AR={ar_label} (main).")
+                    else:
                         w_m, h_m, mfp_val_m = res
                         motion_bucket = (w_m, h_m, motion_frames)
                         print(f"  Motion bucket (main): {w_m}x{h_m} @ {motion_frames} frames (mfp={mfp_val_m})")
-                    else:
-                        print(f"  [WARN] Could not find resolution for motion bucket in AR={ar_label} (main).")
+
+                    # Report any clips that cannot support the final motion bucket.
+                    skipped = []
+                    for (vid, cw, ch, cf) in main_clips:
+                        if cf < motion_frames or cw < w_m or ch < h_m:
+                            skipped.append((vid.name, cw, ch, cf))
+
+                    if skipped:
+                        print(f"\n[WARN] The following clips do NOT meet the chosen motion bucket {w_m}x{h_m} @ {motion_frames} frames and will be skipped for motion:")
+                        for (n, cw, ch, cf) in skipped:
+                            print(f"  - {n}: {cw}x{ch}, {cf} frames")
+                        print("")
                 else:
-                    print(f"  [WARN] No suitable frame count for motion bucket in AR={ar_label} (main).")
+                    # As a last resort, create a conservative low-res motion bucket
+                    # so the AR always has a motion bucket (per policy).
+                    cands = generate_candidate_resolutions_for_ar(target_ar, ar_label)
+                    if cands:
+                        cw, ch, _ = cands[-1]
+                        motion_frames = LONG_MOTION_FRAME_CANDIDATES[-1]
+                        motion_bucket = (cw, ch, motion_frames)
+                        print(f"  Motion bucket (main) [conservative fallback]: {cw}x{ch} @ {motion_frames} frames")
+                    else:
+                        print(f"  [WARN] No candidates available to create a conservative motion bucket for AR={ar_label}.")
 
-                # Detail bucket (main)
-                sorted_by_area = sorted(
-                    usable_clips,
-                    key=lambda x: compute_clip_area(x[1], x[2]),
-                    reverse=True
-                )
-                total_usable = len(sorted_by_area)
-                target_detail_n = max(int(total_usable * DETAIL_TOP_FRACTION), 1)
-                pre_detail_clips = sorted_by_area[:target_detail_n]
-
-                min_detail_frames = min(DETAIL_FRAME_CANDIDATES)
-                detail_candidates = [c for c in pre_detail_clips if c[3] >= min_detail_frames]
-                detail_fraction = len(detail_candidates) / float(total_usable) if total_usable > 0 else 0.0
-
-                if detail_candidates and detail_fraction >= MIN_DETAIL_FRACTION:
-                    detail_frame_counts = [f for (_, _, _, f) in detail_candidates]
-                    detail_frames = select_frames_with_fallback(
-                        detail_frame_counts,
-                        DETAIL_FRAME_CANDIDATES,
-                        coverage_threshold=0.8
+                # Detail bucket policy: skip entirely if motion short edge >= 512
+                detail_bucket = None
+                if motion_bucket and min(motion_bucket[0], motion_bucket[1]) >= 512:
+                    print(f"  [INFO] Detail bucket skipped: motion bucket short edge {min(motion_bucket[0], motion_bucket[1])} >= 512 (sufficient spatial resolution).")
+                else:
+                    # Detail bucket selection: higher-res than motion, optional spatial enrichment
+                    sorted_by_area = sorted(
+                        usable_clips,
+                        key=lambda x: compute_clip_area(x[1], x[2]),
+                        reverse=True
                     )
-                    if detail_frames:
-                        # Pre-filter detail candidates to enforce short-edge cap early
-                        if ar_label != "square":
-                            detail_candidates = [
-                                c for c in detail_candidates
-                                if min(c[1], c[2]) <= DETAIL_MAX_DIM
-                            ]
+                    total_usable = len(sorted_by_area)
+                    
+                    # Generate candidates that are strictly higher-res than motion
+                    cands = generate_candidate_resolutions_for_ar(target_ar, ar_label)
+                    motion_area = (motion_bucket[0] * motion_bucket[1]) if motion_bucket else 0
+                    
+                    allowed = []
+                    for (cw, ch, area) in cands:
+                        if area <= motion_area:
+                            continue
+                        if not within_wan_caps(ar_label, cw, ch):
+                            continue
+                        # Apply detail caps
+                        if ar_label == "square":
+                            if cw > SQUARE_DETAIL_MAX_DIM or ch > SQUARE_DETAIL_MAX_DIM:
+                                continue
                         else:
-                            detail_candidates = [
-                                c for c in detail_candidates
-                                if c[1] <= SQUARE_DETAIL_MAX_DIM and c[2] <= SQUARE_DETAIL_MAX_DIM
-                            ]
+                            if min(cw, ch) > DETAIL_MAX_DIM:
+                                continue
+                        allowed.append((cw, ch, area))
 
-                        res = choose_bucket_resolution(
-                            ar_label=ar_label,
-                            target_ar=target_ar,
-                            frames=detail_frames,
-                            clips=detail_candidates,
-                            coverage_threshold=0.8,
-                            mfp_limit=mfp_limit,
-                        )
-                        if res:
-                            w_d, h_d, mfp_val_d = res
-                            detail_bucket = (w_d, h_d, detail_frames)
-                            # Hard cap detail buckets to avoid swapping (treat DETAIL_MAX_DIM as *short-edge* cap)
-                            if ar_label == "square":
-                                if w_d > SQUARE_DETAIL_MAX_DIM or h_d > SQUARE_DETAIL_MAX_DIM:
-                                    print(f"  [INFO] Detail bucket skipped: {w_d}x{h_d} exceeds square cap {SQUARE_DETAIL_MAX_DIM}.")
+                    if not allowed:
+                        print(f"  [INFO] Detail bucket skipped: no WAN-safe candidates exist that are higher-res than motion for AR={ar_label}.")
+                    else:
+                        # Pick largest allowed resolution (honest detail enrichment)
+                        allowed.sort(key=lambda x: x[2], reverse=True)
+                        w_d, h_d, _ = allowed[0]
+                        
+                        # Compute how many clips can support this detail resolution
+                        # (must meet minimum frame requirement: at least 5 frames)
+                        min_detail_frames = 5
+                        num_support = sum(1 for (_, cw, ch, cf) in usable_clips 
+                                        if cw >= w_d and ch >= h_d and cf >= min_detail_frames)
+                        
+                        if num_support == 0:
+                            print(f"  [INFO] Detail bucket skipped: no clips can support {w_d}x{h_d} at {min_detail_frames}+ frames.")
+                        else:
+                            support_frac = num_support / float(total_usable) if total_usable > 0 else 0.0
+                            
+                            # Conditional frame selection based on support fraction
+                            if support_frac >= 0.5:
+                                detail_frames = 5  # good coverage, fewer frames
                             else:
-                                if min(w_d, h_d) > DETAIL_MAX_DIM:
-                                    print(f"  [INFO] Detail bucket skipped: {w_d}x{h_d} exceeds short-edge cap {DETAIL_MAX_DIM} for AR={ar_label}.")
+                                detail_frames = 13  # lower coverage, more frames
 
-                            if detail_bucket is not None:
+                            # Verify at least some clips meet the final frame requirement
+                            final_support = sum(1 for (_, cw, ch, cf) in usable_clips 
+                                              if cw >= w_d and ch >= h_d and cf >= detail_frames)
+                            
+                            if final_support == 0:
+                                print(f"  [INFO] Detail bucket skipped: no clips can support {w_d}x{h_d} at {detail_frames} frames.")
+                            else:
+                                detail_bucket = (w_d, h_d, detail_frames)
+                                final_support_frac = final_support / float(total_usable) if total_usable > 0 else 0.0
                                 print(
                                     f"  Detail bucket (main): {w_d}x{h_d} @ {detail_frames} frames "
-                                    f"(mfp={mfp_val_d}) using top {len(detail_candidates)}/{total_usable} clips by area"
+                                    f"using {final_support}/{total_usable} clips (support={final_support_frac:.2f})"
                                 )
-                        else:
-                            print(f"  [WARN] Could not find resolution for detail bucket in AR={ar_label} (main).")
-                    else:
-                        print(f"  [WARN] No suitable frame count for detail bucket in AR={ar_label} (main).")
-                else:
-                    if not detail_candidates:
-                        print(f"  [INFO] Detail bucket (main) skipped: no candidates meet min frame requirement.")
-                    else:
-                        print(
-                            f"  [INFO] Detail bucket (main) skipped: only {len(detail_candidates)}/{total_usable} "
-                            f"clips ({detail_fraction:.2f}) eligible (< {MIN_DETAIL_FRACTION:.2f})."
-                        )
 
                 # Middle bucket (main) disabled: keeps compute reasonable and avoids near-duplicate buckets.
 
@@ -911,16 +968,128 @@ def main():
                 video_buckets.sort(key=lambda x: x[2], reverse=True)
 
                 if video_buckets:
-                    toml_lines += [
-                        "\n[[directory]]",
-                        f'path = "{ar_dir.as_posix()}"',
-                        "num_repeats = 2",
-                        'group = "videos"',
-                        "size_buckets = [",
-                    ]
-                    for (w, h, f) in video_buckets:
-                        toml_lines.append(f"  [{w}, {h}, {f}],")
-                    toml_lines += ["]"]
+                    # compute support counts for motion and detail (for dominance decisions)
+                    motion_support = 0
+                    detail_support = 0
+                    if motion_bucket:
+                        mw, mh, mf = motion_bucket
+                        motion_support = sum(1 for (_, cw, ch, cf) in usable_clips if cf >= mf and cw >= mw and ch >= mh)
+                    if detail_bucket:
+                        dw, dh, df = detail_bucket
+                        detail_support = sum(1 for (_, cw, ch, cf) in usable_clips if cf >= df and cw >= dw and ch >= dh)
+
+                    # Helper: emit commented alternative suggestions for a chosen bucket
+                    def _emit_alternatives(chosen_w, chosen_h, chosen_f):
+                        """Show adjacent resolutions (±32px steps) without frame counts. Can exceed caps."""
+                        # Generate all candidates without cap filtering for alternatives
+                        is_square = (ar_label == "square")
+                        all_cands = []
+                        
+                        # Extend range beyond caps for alternatives
+                        max_h = 1024 if is_square else 1024
+                        for h in range(256, max_h + 1, 32):
+                            if is_square:
+                                w = h
+                            else:
+                                ideal_w = target_ar * h
+                                w = int(round(ideal_w / 32) * 32)
+                            
+                            if w < 256:
+                                continue
+                            
+                            if not is_square:
+                                ar_val = w / float(h)
+                                if abs(ar_val - target_ar) > AR_TOL:
+                                    continue
+                            
+                            area = w * h
+                            all_cands.append((w, h, area))
+                        
+                        all_cands.sort(key=lambda x: x[2], reverse=True)
+                        
+                        if not all_cands:
+                            return []
+                        
+                        # Find the index of the chosen resolution
+                        chosen_idx = None
+                        for i, (w, h, area) in enumerate(all_cands):
+                            if w == chosen_w and h == chosen_h:
+                                chosen_idx = i
+                                break
+                        
+                        if chosen_idx is None:
+                            return []
+                        
+                        # Get adjacent resolutions (one step down and one step up), excluding current
+                        alts = []
+                        if chosen_idx + 1 < len(all_cands):  # one step smaller (higher index = smaller area)
+                            w, h, _ = all_cands[chosen_idx + 1]
+                            alts.append(f"[{w}, {h}]")
+                        
+                        if chosen_idx - 1 >= 0:  # one step larger (lower index = larger area)
+                            w, h, _ = all_cands[chosen_idx - 1]
+                            alts.append(f"[{w}, {h}]")
+                        
+                        # Skip if we have no alternatives
+                        if len(alts) == 0:
+                            return []
+                        
+                        return alts
+
+                    # If detail is substantial relative to motion, split into two stanzas
+                    split_detail = False
+                    if detail_bucket and motion_support > 0:
+                        if (detail_support / float(motion_support)) >= 0.65:
+                            split_detail = True
+                            print(f"  [INFO] Detail bucket supports {detail_support}/{motion_support} clips (>=65%): splitting into separate stanza.")
+
+                    if split_detail:
+                        # motion stanza (num_repeats=2)
+                        mw, mh, mf = motion_bucket
+                        toml_lines += [
+                            "\n[[directory]]",
+                            f'path = "{ar_dir.as_posix()}"',
+                            "num_repeats = 2",
+                            'group = "videos"',
+                            "size_buckets = [",
+                        ]
+                        alts = _emit_alternatives(mw, mh, mf)
+                        if alts:
+                            toml_lines.append(f"# Alternatives: {', '.join(alts)}")
+                        toml_lines.append(f"  [{mw}, {mh}, {mf}],")
+                        toml_lines += ["]"]
+
+                        # detail stanza (num_repeats=1), separate dir
+                        detail_dir = dataset_root / f"{ar_label}_detail"
+                        dw, dh, df = detail_bucket
+                        toml_lines += [
+                            "\n[[directory]]",
+                            f'path = "{detail_dir.as_posix()}"',
+                            "num_repeats = 1",
+                            'group = "videos"',
+                            "size_buckets = [",
+                        ]
+                        alts = _emit_alternatives(dw, dh, df)
+                        if alts:
+                            toml_lines.append(f"# Alternatives: {', '.join(alts)}")
+                        toml_lines.append(f"  [{dw}, {dh}, {df}],")
+                        toml_lines += ["]"]
+                    else:
+                        # single stanza: motion first then detail (if present)
+                        toml_lines += [
+                            "\n[[directory]]",
+                            f'path = "{ar_dir.as_posix()}"',
+                            "num_repeats = 2",
+                            'group = "videos"',
+                            "size_buckets = [",
+                        ]
+                        for (w, h, f) in video_buckets:
+                            # emit alternatives comment per-bucket
+                            alts = _emit_alternatives(w, h, f)
+                            if alts:
+                                toml_lines.append(f"# Alternatives: {', '.join(alts)}")
+                            toml_lines.append(f"  [{w}, {h}, {f}],")
+                        toml_lines += ["]"]
 
         # ------------- HIGHRES BUCKET (disabled) -------------
         # Intentionally disabled: prefer skipping outliers over creating *_highres directories.
@@ -941,24 +1110,50 @@ def main():
 
             if image_bucket_regular:
                 iw, ih = image_bucket_regular
+                # Emit commented alternatives for image bucket
+                cands = generate_candidate_resolutions_for_ar(target_ar, ar_label)
+                filtered = [ (w,h,a) for (w,h,a) in cands if within_wan_caps(ar_label,w,h) and max(w,h) <= IMG_REGULAR_MAX_DIM ]
+                alt_line = None
+                if filtered:
+                    min_w, min_h, _ = filtered[-1]
+                    max_w, max_h, _ = filtered[0]
+                    alt_line = f"# Alternatives MIN/MID/MAX for images: [{min_w}, {min_h}, 1], [{iw}, {ih}, 1], [{max_w}, {max_h}, 1]"
+
                 toml_lines += [
                     "\n[[directory]]",
                     f'path = "{ar_img_dir.as_posix()}"',
                     "num_repeats = 1",
                     'group = "images"',
                     "size_buckets = [",
+                ]
+                if alt_line:
+                    toml_lines.append(alt_line)
+                toml_lines += [
                     f"  [{iw}, {ih}, 1],",
                     "]",
                 ]
 
             if hi_images and image_bucket_highres:
                 iw, ih = image_bucket_highres
+                # Highres image bucket with alternatives
+                cands = generate_candidate_resolutions_for_ar(target_ar, ar_label)
+                filtered = [ (w,h,a) for (w,h,a) in cands if within_wan_caps(ar_label,w,h) and min(w,h) >= 256 ]
+                alt_line = None
+                if filtered:
+                    min_w, min_h, _ = filtered[-1]
+                    max_w, max_h, _ = filtered[0]
+                    alt_line = f"# Alternatives MIN/MID/MAX for images (highres): [{min_w}, {min_h}, 1], [{iw}, {ih}, 1], [{max_w}, {max_h}, 1]"
+
                 toml_lines += [
                     "\n[[directory]]",
                     f'path = "{ar_img_hi_dir.as_posix()}"',
                     "num_repeats = 1",
                     'group = "images"',
                     "size_buckets = [",
+                ]
+                if alt_line:
+                    toml_lines.append(alt_line)
+                toml_lines += [
                     f"  [{iw}, {ih}, 1],",
                     "]",
                 ]
@@ -971,12 +1166,23 @@ def main():
             "bucket_highres": image_bucket_highres,
         }
 
+        # Store split_detail decision for file copy phase
+        split_detail_flag = False
+        if detail_bucket and motion_bucket:
+            mw, mh, mf = motion_bucket
+            motion_support = sum(1 for (_, cw, ch, cf) in main_clips if cf >= mf and cw >= mw and ch >= mh)
+            dw, dh, df = detail_bucket
+            detail_support = sum(1 for (_, cw, ch, cf) in main_clips if cf >= df and cw >= dw and ch >= dh)
+            if motion_support > 0 and (detail_support / float(motion_support)) >= 0.65:
+                split_detail_flag = True
+
         bucket_json[ar_label] = {
             "motion": motion_bucket,
             "middle": middle_bucket,
             "detail": detail_bucket,
             "fallback": fallback_bucket,
             "highres": highres_bucket,
+            "split_detail": split_detail_flag,
             "num_clips": total_clips_ar,
             "num_main_clips": len(main_clips),
             "num_highres_clips": len(hi_clips),
@@ -999,12 +1205,35 @@ def main():
         if not main_clips and not hi_clips and not reg_imgs and not hi_imgs:
             continue
 
-        # No highres spillover dirs: treat all clips as main
+        # Handle split_detail case: copy to motion dir and/or detail dir
         all_clips = main_clips + hi_clips
         if all_clips:
+            ar_bucket_info = bucket_json.get(ar_label, {})
+            motion_bucket = ar_bucket_info.get("motion")
+            detail_bucket = ar_bucket_info.get("detail")
+            split_detail = ar_bucket_info.get("split_detail", False)
+
             ar_dir = dataset_root / ar_label
-            for (vid, w, h, f) in all_clips:
-                copy_with_caption(vid, ar_dir)
+            
+            if split_detail and detail_bucket:
+                # Split mode: motion gets all supporting clips (primary temporal prior),
+                # detail gets ONLY high-res clips (spatial enrichment, controlled by num_repeats=1)
+                detail_dir = dataset_root / f"{ar_label}_detail"
+                mw, mh, mf = motion_bucket
+                dw, dh, df = detail_bucket
+                
+                for (vid, w, h, f) in all_clips:
+                    # Copy to motion if clip supports it (motion is primary)
+                    if w >= mw and h >= mh and f >= mf:
+                        copy_with_caption(vid, ar_dir)
+                    
+                    # ALSO copy to detail if clip supports it (duplication for controlled exposure)
+                    if w >= dw and h >= dh and f >= df:
+                        copy_with_caption(vid, detail_dir)
+            else:
+                # Normal mode: copy all to main AR directory
+                for (vid, w, h, f) in all_clips:
+                    copy_with_caption(vid, ar_dir)
 
         # Copy images (if any) according to the image_plan for this AR
         if reg_imgs:
@@ -1057,24 +1286,24 @@ def main():
             ]
         }
 
-    res_json_path = dataset_root / "resolution_rankings.json"
-    with res_json_path.open("w", encoding="utf-8") as jf:
-        json.dump(resolution_json, jf, indent=2)
-
-    print(f"\n[INFO] Resolution rankings written to {res_json_path}\n")
+    if args.verbose:
+        res_json_path = dataset_root / "resolution_rankings.json"
+        with res_json_path.open("w", encoding="utf-8") as jf:
+            json.dump(resolution_json, jf, indent=2)
+        print(f"[INFO] Resolution rankings written to {res_json_path}\n")
 
     # Write TOML
     toml_path = dataset_root / args.toml_name
     with toml_path.open("w", encoding="utf-8") as f:
         f.write("\n".join(toml_lines) + "\n")
 
-    # JSON summary
-    json_path = dataset_root / "wan_auto_buckets.json"
-    with json_path.open("w", encoding="utf-8") as f:
-        json.dump(bucket_json, f, indent=2)
+    if args.verbose:
+        json_path = dataset_root / "wan_auto_buckets.json"
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(bucket_json, f, indent=2)
+        print(f"[INFO] Bucket summary written to {json_path}\n")
 
-    print(f"\n[INFO] Dataset TOML written to {toml_path}")
-    print(f"[INFO] Bucket summary written to {json_path}\n")
+    print(f"[INFO] Dataset TOML written to {toml_path}")
     # -------------------------
     # EVAL SET GENERATION (optional)
     # -------------------------
